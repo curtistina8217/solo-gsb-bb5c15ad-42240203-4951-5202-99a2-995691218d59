@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      CALIB_DB_PATH: /data/calibration.db
+      # 仅用于本地开发的默认密钥；生产部署必须通过同名环境变量覆盖，例如：
+      #   CORRECTION_RECEIPT_SECRET=$(openssl rand -hex 32) docker compose up -d
+      CORRECTION_RECEIPT_SECRET: ${CORRECTION_RECEIPT_SECRET:-dev-only-insecure-correction-receipt-secret}
+    volumes:
+      - calibration-data:/data
+    restart: unless-stopped
+
+volumes:
+  calibration-data:

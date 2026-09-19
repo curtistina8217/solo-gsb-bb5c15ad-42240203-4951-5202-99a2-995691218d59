@@ -10,6 +10,7 @@ from . import receipts
 from . import service
 from .calibration import CalibrationError
 from .db import init_db
+from .receipt_keys import load_key_ring
 from .models import (
     CorrectionIn,
     CorrectionOut,
@@ -48,13 +49,15 @@ from .service import (
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 启动即校验回执键环：空键环、未知活跃键、非法 key_id 等配置错误直接拒绝启动
+    load_key_ring()
     init_db()
     yield
 
 
 app = FastAPI(
     title="Instrument Calibration Drift Compensation API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交参考值与同一时点至少 3 次读数，服务标记异常读数并计算校准偏差；"
         "在相邻观测时点间线性插值偏差，对待校正读数施加补偿。"
@@ -171,11 +174,11 @@ def post_correction(payload: CorrectionIn) -> dict:
 def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
     """对漂移补偿结果签发版本化 HMAC 回执（复用 /corrections 的补偿逻辑）。
 
-    返回 version=1、归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、
-    UTC Unix 毫秒整数 issued_at，以及对
-    [version,timestamp,reading,bias,corrected,issued_at] 做 HMAC-SHA256
-    （密钥取自 CORRECTION_RECEIPT_SECRET）得到的小写十六进制 receipt。
-    覆盖范围外与 /corrections 一样返回 400。
+    返回 version=2、key_id（CORRECTION_RECEIPT_ACTIVE_KEY 指定的当前签发键）、
+    归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、UTC Unix 毫秒整数
+    issued_at，以及对 [version,key_id,timestamp,reading,bias,corrected,issued_at]
+    做 HMAC-SHA256（密钥取自 CORRECTION_RECEIPT_KEYS 键环中 key_id 对应的密钥）
+    得到的小写十六进制 receipt。覆盖范围外与 /corrections 一样返回 400。
     """
     try:
         return receipts.issue_receipt(ts=payload.timestamp, reading=payload.reading)
@@ -185,11 +188,15 @@ def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
 
 @app.post("/correction-receipts/verify", response_model=CorrectionReceiptVerifyOut)
 def post_correction_receipt_verify(payload: CorrectionReceiptVerifyIn) -> dict:
-    """校验完整回执：重算签名并以常量时间比较。
+    """校验完整回执：按 key_id 精确选键重算签名并以常量时间比较。
 
-    任一签名字段（version/request.timestamp/request.reading/bias/corrected/
+    version=2 回执以 CORRECTION_RECEIPT_KEYS 键环中 key_id 对应的密钥验签，
+    key_id 未知或已轮换出环返回 {"valid": false}（旧键保留在环内时，轮换前签发
+    的回执仍可验证）；version=1 历史回执沿用 CORRECTION_RECEIPT_SECRET 的旧规则。
+    任一签名字段（version/key_id/request.timestamp/request.reading/bias/corrected/
     issued_at/receipt）被改动返回 {"valid": false}；结构缺失或类型错误
-    （如字符串冒充数值、issued_at 为小数）由 Pydantic strict 校验拒绝为 422。
+    （如字符串冒充数值、issued_at 为小数、version=2 缺 key_id）由 Pydantic
+    strict 校验拒绝为 422。
     """
     return {"valid": receipts.verify_receipt(payload)}
 

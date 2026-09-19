@@ -5,8 +5,14 @@ services:
       - "8000:8000"
     environment:
       CALIB_DB_PATH: /data/calibration.db
-      # 仅用于本地开发的默认密钥；生产部署必须通过同名环境变量覆盖，例如：
-      #   CORRECTION_RECEIPT_SECRET=$(openssl rand -hex 32) docker compose up -d
+      # v2 回执键环（JSON 对象：key_id -> 密钥）与当前签发键；默认值仅供本地开发，
+      # 生产部署必须覆盖，例如：
+      #   CORRECTION_RECEIPT_KEYS='{"2026-09":"<openssl rand -hex 32>"}' \
+      #     CORRECTION_RECEIPT_ACTIVE_KEY=2026-09 docker compose up -d
+      CORRECTION_RECEIPT_KEYS: ${CORRECTION_RECEIPT_KEYS:-{"dev":"dev-only-insecure-correction-receipt-secret"}}
+      CORRECTION_RECEIPT_ACTIVE_KEY: ${CORRECTION_RECEIPT_ACTIVE_KEY:-dev}
+      # version=1 历史回执的验签密钥（也是未配置键环时开发环的密钥来源）；
+      # 仅用于本地开发的默认值，生产部署必须通过同名环境变量覆盖
       CORRECTION_RECEIPT_SECRET: ${CORRECTION_RECEIPT_SECRET:-dev-only-insecure-correction-receipt-secret}
     volumes:
       - calibration-data:/data

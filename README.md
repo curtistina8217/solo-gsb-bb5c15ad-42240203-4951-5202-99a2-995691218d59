@@ -29,7 +29,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 11. **漂移稳定窗口分析**：`GET /drift-stability-window?from=&to=&max_spread=` 在覆盖范围内**解析求出** `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间：最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量（`m` 取遍折点取值及其下移 `max_spread` 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、`duration_seconds` 与窗口内实际达到的 `min_bias`/`max_bias`。`from` 必须小于 `to`、`max_spread` 必须为正数，任一边界越界返回 400。
 12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
 13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**不落库**的候选观测与正数 `impact_limit`，沿用现有异常判定算出候选偏差，预演插入对当前分段线性偏差曲线的影响。仅在候选时点两侧都已有观测时预演（候选时点已占用或无法形成双侧邻点均返回 409）：插入只会把左右最近观测之间的区间重新分段，受影响范围即 `[prev, next]`；曲线变化量 Δ 是折点 `(prev, 0) → (候选, Δc) → (next, 0)` 的分段线性函数，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，以及 `|Δ| > impact_limit` 的连续区间（阈值交点解析求解，恰等于阈值的瞬时不计入，不做固定步长采样）。请求**只读**，不改写观测、修订历史或区间表。
-14. **校正回执**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并对结果签发版本化 HMAC 回执：固定返回 `version=1`、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。签名载荷按 `version`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，再以 `CORRECTION_RECEIPT_SECRET` 为密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，重算签名并以**常量时间**比较：任一签名字段被改动返回 `{"valid": false}`；结构缺失或类型错误（如字符串冒充数值、`issued_at` 为小数）返回 422。
+14. **校正回执**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并对结果签发版本化 HMAC 回执：当前新签发为 **v2**，携带 `key_id`（`CORRECTION_RECEIPT_ACTIVE_KEY` 指定的当前签发键）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。v2 签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，再以 `CORRECTION_RECEIPT_KEYS` 中该 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，重算签名并以**常量时间**比较：v2 **严格按回执中的 `key_id` 精确选键**，`key_id` 未知或密钥已从键环移除（含缺失）均返回 `{"valid": false}`，因此轮换时保留旧键即可让轮换前回执继续验证，退役旧键后其回执立即失效；服务**继续接受 v1 回执**（载荷为 `[version,timestamp,reading,bias,corrected,issued_at]`），验签沿用旧的 `CORRECTION_RECEIPT_SECRET` 单密钥规则，与现行键环无关。任一签名字段被改动返回 `{"valid": false}`；结构缺失或类型错误（如字符串冒充数值、`issued_at` 为小数）返回 422。密钥环在**启动时**严格校验：空键环、`CORRECTION_RECEIPT_ACTIVE_KEY` 不在键环中、非法 `key_id`（非空、1–64 字符、仅 `[A-Za-z0-9_-]`）均拒绝启动。
 
 ## API 一览
 
@@ -200,7 +200,8 @@ curl -X POST http://localhost:8000/correction-receipts \
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "key_id": "2026-09",
   "request": {"timestamp": 1789722000.0, "reading": 98.0},
   "bias": 2.0,
   "corrected": 100.0,
@@ -209,23 +210,65 @@ curl -X POST http://localhost:8000/correction-receipts \
 }
 ```
 
-- `version`：回执格式版本，当前固定为 `1`。
+- `version`：回执格式版本，当前新签发固定为 `2`；`version=1` 的历史回执仍可被校验（见下文）。
+- `key_id`：签发所用密钥在密钥环 `CORRECTION_RECEIPT_KEYS` 中的键名，即签发时的 `CORRECTION_RECEIPT_ACTIVE_KEY`。验签严格按它**精确选键**：键环中找不到该 `key_id`（未知或轮换后已移除）一律 `valid=false`。
 - `request`：**归一化请求**——ISO 8601/数字字符串等时间格式统一为 Unix 秒数值，`reading` 为数值。
 - `issued_at`：签发时刻，UTC Unix **毫秒整数**。
-- `receipt`：HMAC-SHA256 小写十六进制摘要（64 个字符）。签名载荷是把 `version`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 按此顺序组成的 **JSON 数组**，数值取 JSON 最短十进制（如上例即 `[1,1789722000.0,98.0,2.0,100.0,1789844210712]`），以 UTF-8 编码、不含任何空白后参与 HMAC。
+- `receipt`：HMAC-SHA256 小写十六进制摘要（64 个字符）。v2 签名载荷是把 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 按此顺序组成的 **JSON 数组**，数值取 JSON 最短十进制（如上例即 `[2,"2026-09",1789722000.0,98.0,2.0,100.0,1789844210712]`），以 UTF-8 编码、不含任何空白后参与 HMAC。
 
 校验时把**完整回执原样**回传：
 
 ```bash
 curl -X POST http://localhost:8000/correction-receipts/verify \
   -H 'Content-Type: application/json' \
-  -d '{"version":1,"request":{"timestamp":1789722000.0,"reading":98.0},
+  -d '{"version":2,"key_id":"2026-09","request":{"timestamp":1789722000.0,"reading":98.0},
        "bias":2.0,"corrected":100.0,"issued_at":1789844210712,
        "receipt":"b15e3aec42107a3959ccd65012fa6124e1f82c3742be43ae7d3a897299aad313"}'
 # {"valid":true}
 ```
 
-任一签名字段（含 `version`、`request.timestamp`、`request.reading`、`bias`、`corrected`、`issued_at`、`receipt`）被改动，均返回 `{"valid": false}`；校验只重算签名做常量时间比较，不会因数据库中的校准状态变化而失效。字段缺失或类型错误（例如时间戳传字符串、`issued_at` 传小数、`receipt` 传数字、整体不是 JSON 对象）一律返回 **422**。未签名的额外字段不影响校验结果。
+任一签名字段（含 `version`、`key_id`、`request.timestamp`、`request.reading`、`bias`、`corrected`、`issued_at`、`receipt`）被改动，均返回 `{"valid": false}`；回执声明的 `key_id` 在当前键环中不存在（未知或已移除）同样是 `{"valid": false}`。校验只重算签名做常量时间比较，不会因数据库中的校准状态变化而失效。字段缺失或类型错误（例如时间戳传字符串、`issued_at` 传小数、`key_id` 传数字、`receipt` 传数字、整体不是 JSON 对象）一律返回 **422**；v2 回执缺少 `key_id` 字段属签名失效，返回 `{"valid": false}`。未签名的额外字段不影响校验结果。
+
+**v1 历史回执兼容**：升级前签发的 `version=1` 回执（无 `key_id` 字段，签名载荷为 `[1,timestamp,reading,bias,corrected,issued_at]`）继续被接受，密钥一律取自旧配置 `CORRECTION_RECEIPT_SECRET`（未设置时为开发默认值），与现行密钥环互不影响；即使键环中的密钥已轮换或移除，只要旧密钥未改，v1 回执仍可验证。反之，伪造或篡改的 v1 回执（如把 `version` 改成 2 却不提供匹配的 v2 签名）一律 `valid=false`。
+
+### 回执密钥轮换
+
+密钥环通过两个环境变量配置，启动时严格校验，配置非法则**拒绝启动**（不使用带病配置运行）：
+
+- `CORRECTION_RECEIPT_KEYS`：JSON 对象，`key_id` → 密钥字符串的映射。`key_id` 必须非空、1–64 字符且仅含 `[A-Za-z0-9_-]`（如日期段 `2026-09`）；密钥必须是非空字符串，映射不允许为空对象。
+- `CORRECTION_RECEIPT_ACTIVE_KEY`：当前**签发**键的 `key_id`，必须是密钥环中的成员，否则启动失败。
+- 两个变量都未设置时回退旧版单密钥模式（见下文），`docker compose up` 无需任何额外配置。
+
+典型轮换流程——**先并存、再切换、后退役**：
+
+```bash
+# 1) 生成新密钥，把新旧密钥同时放入键环（此步不切换签发键，重启后行为不变）
+CORRECTION_RECEIPT_KEYS='{"2026-03":"<old-secret>","2026-09":"<new-secret>"}' \
+CORRECTION_RECEIPT_ACTIVE_KEY=2026-03 \
+docker compose up -d
+
+# 2) 把签发键切到新 key_id；旧键保留在键环中，轮换前的回执照常验证通过
+CORRECTION_RECEIPT_KEYS='{"2026-03":"<old-secret>","2026-09":"<new-secret>"}' \
+CORRECTION_RECEIPT_ACTIVE_KEY=2026-09 \
+docker compose up -d
+
+# 3) 待旧回执全部到期后，从键环移除旧键；此后用 2026-03 签名的回执立即 valid=false
+CORRECTION_RECEIPT_KEYS='{"2026-09":"<new-secret>"}' \
+CORRECTION_RECEIPT_ACTIVE_KEY=2026-09 \
+docker compose up -d
+```
+
+第 2 步之后：
+
+```bash
+# 新回执以 2026-09 签发；旧回执（key_id=2026-03）回传验签仍为 true
+curl -X POST http://localhost:8000/correction-receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"timestamp": 1789722000.0, "reading": 98.0}'
+# {"version":2,"key_id":"2026-09",...}
+```
+
+兼容旧版单密钥部署（或只做快速本地验证）也可以不配置密钥环：仅设置 `CORRECTION_RECEIPT_SECRET` 时，服务合成一个只含 `legacy` 键的键环，新回执为 `version=2、key_id="legacy"`，签名密钥即该 secret；升级前签发的 `version=1` 回执同样继续可验。
 
 ### 历史时点漂移补偿（as_of 状态重建）
 
@@ -412,14 +455,25 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 环境变量：
 
 - `CALIB_DB_PATH`：SQLite 文件路径（容器内默认 `/data/calibration.db`，本地开发默认 `./calibration.db`）。
-- `CORRECTION_RECEIPT_SECRET`：校正回执 HMAC-SHA256 密钥。**生产部署必须覆盖**为高强度随机值，例如：
+- `CORRECTION_RECEIPT_KEYS`：校正回执密钥环，JSON 对象形式的 `key_id` → 密钥映射，例如 `{"2026-09":"<hex>"}`；`key_id` 须为 1–64 字符的 `[A-Za-z0-9_-]`，密钥须为非空字符串。**生产部署推荐使用**并给每个密钥注入高强度随机值：
 
   ```bash
-  # 单条命令启动：注入随机密钥，前台运行，监听 8000 端口
+  # 单条命令启动：注入双密钥键环与当前签发键
+  CORRECTION_RECEIPT_KEYS="{\"2026-09\":\"$(openssl rand -hex 32)\"}" \
+  CORRECTION_RECEIPT_ACTIVE_KEY=2026-09 \
+  docker compose up --build
+  ```
+
+  启动时强制校验：空键环（`{}`）、`CORRECTION_RECEIPT_ACTIVE_KEY` 未设置或不在键环中、非法 `key_id`、密钥为空/非字符串、JSON 格式错误均会让容器拒绝启动。轮换方式见上文「回执密钥轮换」：新旧键并存、只切换 ACTIVE，旧回执即可继续验证；退役旧键（从映射中删除）后其回执立即 `valid=false`。验签严格按回执 `key_id` 精确选键，绝不遍历其它密钥。
+- `CORRECTION_RECEIPT_ACTIVE_KEY`：当前新签发回执使用的 `key_id`；配置了 `CORRECTION_RECEIPT_KEYS` 时必须同时提供且为键环成员。
+- `CORRECTION_RECEIPT_SECRET`：旧版单密钥（**兼容配置**）。仅当 `CORRECTION_RECEIPT_KEYS` 未设置（或为空）时生效：服务合成仅含 `legacy` 一个键的密钥环，新回执为 `version=2、key_id="legacy"`，v1 历史回执的验签也始终使用该密钥。未设置时 Compose 与应用会回退到开发默认值 `dev-only-insecure-correction-receipt-secret`（仅供本地调试，任何持有源码者都能伪造回执，切勿用于生产）：
+
+  ```bash
+  # 不配置密钥环的旧式启动
   CORRECTION_RECEIPT_SECRET=$(openssl rand -hex 32) docker compose up --build
   ```
 
-  未设置时 Compose 与应用会回退到开发默认值 `dev-only-insecure-correction-receipt-secret`（仅供本地调试，任何持有源码者都能伪造回执，切勿用于生产）。密钥轮换后，旧密钥签发的回执将校验失败（`valid=false`）；同一服务的签发与校验必须使用相同密钥。
+  更换该 secret 后，v1 回执与 `legacy` 键 v2 回执都将校验失败（`valid=false`）；从单密钥模式迁移到密钥环后，v1 回执仍按此 secret 验证、不受键环轮换影响。
 
 ## 项目结构
 
@@ -427,7 +481,8 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 app/
   main.py         # FastAPI 路由
   service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演
-  receipts.py     # 校正回执：复用漂移补偿、HMAC-SHA256 签名与常量时间校验
+  receipts.py     # 校正回执：复用漂移补偿、v2/v1 HMAC-SHA256 签名与常量时间校验
+  keyrotation.py  # 回执密钥环：CORRECTION_RECEIPT_KEYS/ACTIVE_KEY 解析、启动校验与按 key_id 精确选键
   calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解、插入影响解析比较
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表

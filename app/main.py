@@ -6,6 +6,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
 
+from . import keyrotation
 from . import receipts
 from . import service
 from .calibration import CalibrationError
@@ -48,6 +49,8 @@ from .service import (
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 启动即校验回执密钥环：空键环、未知活跃键、非法 key_id 直接拒绝启动
+    keyrotation.validate_config()
     init_db()
     yield
 
@@ -171,11 +174,13 @@ def post_correction(payload: CorrectionIn) -> dict:
 def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
     """对漂移补偿结果签发版本化 HMAC 回执（复用 /corrections 的补偿逻辑）。
 
-    返回 version=1、归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、
-    UTC Unix 毫秒整数 issued_at，以及对
-    [version,timestamp,reading,bias,corrected,issued_at] 做 HMAC-SHA256
-    （密钥取自 CORRECTION_RECEIPT_SECRET）得到的小写十六进制 receipt。
-    覆盖范围外与 /corrections 一样返回 400。
+    返回 version=2、key_id（CORRECTION_RECEIPT_ACTIVE_KEY 指定的当前签发键）、
+    归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、UTC Unix 毫秒整数
+    issued_at，以及对
+    [version,key_id,timestamp,reading,bias,corrected,issued_at] 做 HMAC-SHA256
+    （密钥取自 CORRECTION_RECEIPT_KEYS 中 key_id 对应的键）得到的小写十六进制
+    receipt。覆盖范围外与 /corrections 一样返回 400；密钥环配置非法在启动时
+    即被拒绝。
     """
     try:
         return receipts.issue_receipt(ts=payload.timestamp, reading=payload.reading)
@@ -187,9 +192,13 @@ def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
 def post_correction_receipt_verify(payload: CorrectionReceiptVerifyIn) -> dict:
     """校验完整回执：重算签名并以常量时间比较。
 
-    任一签名字段（version/request.timestamp/request.reading/bias/corrected/
-    issued_at/receipt）被改动返回 {"valid": false}；结构缺失或类型错误
-    （如字符串冒充数值、issued_at 为小数）由 Pydantic strict 校验拒绝为 422。
+    v2 回执严格按其 key_id 在 CORRECTION_RECEIPT_KEYS 中精确选键，key_id 未知
+    或对应密钥已移除返回 {"valid": false}（轮换时保留旧键，轮换前签发的回执
+    仍可验证）；v1 回执继续接受，沿用 CORRECTION_RECEIPT_SECRET 旧密钥规则。
+    任一签名字段（version/key_id/request.timestamp/request.reading/bias/
+    corrected/issued_at/receipt）被改动返回 {"valid": false}；结构缺失或类型
+    错误（如字符串冒充数值、issued_at 为小数）由 Pydantic strict 校验拒绝为
+    422。
     """
     return {"valid": receipts.verify_receipt(payload)}
 
